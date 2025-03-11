@@ -57,3 +57,11 @@ _darcs
 /projects/*/datasets
 /models
 /snippet
+/dataset
+/ovdetr/cytology_dataset/annotations
+/ovdetr/cytology_dataset/images
+/ovdetr/cytology_dataset/train
+/ovdetr/cytology_dataset/val
+/cytology_dataset
+/env
+/cytology_images
