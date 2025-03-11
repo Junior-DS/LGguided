@@ -11,12 +11,16 @@ from functools import partial
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
-
+from ovdetr.cytology_dataset.proposal_quality import ProposalEnhancer
 
 class CytologyPreprocessor:
-    def __init__(self, config):
+    def __init__(self, config, enhancer_config):
+        self.enhancer_config = enhancer_config
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Initialize ProposalEnhancer FIRST
+        self.enhancer = ProposalEnhancer(enhancer_config)  # Add this line
         
         # Initialize paths
         self.base_path = Path(config['data_root']).absolute()
@@ -25,6 +29,7 @@ class CytologyPreprocessor:
             'val': self.base_path/'annotations'/config['val_ann']
         }
         self._validate_paths()
+
 
     def _validate_paths(self):
         """Check all required paths exist before processing"""
@@ -105,81 +110,97 @@ class CytologyPreprocessor:
 
 
 
+    # Updated generate_proposals method
     def generate_proposals(self):
-        """Add EdgeBox proposals to existing annotations with quality enhancement and speed optimizations"""
-        edge_detector = cv2.ximgproc.createStructuredEdgeDetection("model.yml")
-        edge_boxes = cv2.ximgproc.createEdgeBoxes()
-        edge_boxes.setMaxBoxes(100)
-        edge_boxes.setAlpha(0.65)  # Adjust for medical images
-        edge_boxes.setBeta(0.75)   # Adjust for cell structures
+        """Quality-focused proposal generation with enhanced stability"""
+        # Initialize thread-local OpenCV context
+        class EdgeDetectionContext:
+            def __init__(self, enhancer_config):
+                self.edge_detector = cv2.ximgproc.createStructuredEdgeDetection("model.yml")
+                self.edge_boxes = cv2.ximgproc.createEdgeBoxes()
+                self.edge_boxes.setMaxBoxes(150)
+                self.edge_boxes.setAlpha(enhancer_config.get('alpha', 0.7))
+                self.edge_boxes.setBeta(enhancer_config.get('beta', 0.8))
 
         def process_image(img, images_dir):
-            """Process a single image and return proposals"""
             filename = Path(img['file_name']).name
             img_path = images_dir / filename
+            ctx = EdgeDetectionContext(self.enhancer_config)  # Per-thread initialization
 
             try:
-                im = cv2.imread(str(img_path))
-                if im is None:
+                # Phase 1: Image Validation
+                im = cv2.imread(str(img_path), cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
+                if im is None or im.size == 0 or im.shape[0] < 10 or im.shape[1] < 10:
+                    print(f"🛑 Invalid image source: {filename}")
                     return img, []
 
-                # Resize large images efficiently
+                # Phase 2: Adaptive Resizing
                 h, w = im.shape[:2]
+                scale = 1.0
                 if max(h, w) > 2000:
-                    im = cv2.resize(im, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+                    scale = 0.5
+                    im = cv2.resize(im, (int(w*scale), int(h*scale)), 
+                                    interpolation=cv2.INTER_AREA)
 
-                # Generate edge and orientation maps
-                im_float = im.astype(np.float32) / 255.0
-                edges = edge_detector.detectEdges(im_float)
-                orientation_map = edge_detector.computeOrientation(edges)
-                edges = edge_detector.edgesNms(edges, orientation_map)
+                # Phase 3: Edge Detection with Fallback
+                try:
+                    im_float = im.astype(np.float32) / 255.0
+                    edges = ctx.edge_detector.detectEdges(im_float)
+                    orientation_map = ctx.edge_detector.computeOrientation(edges)
+                    edges = ctx.edge_detector.edgesNms(edges, orientation_map)
+                except:
+                    # Fallback to Canny edge detection
+                    print(f"⚠️ StructuredEdge failed, using Canny: {filename}")
+                    gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+                    edges = cv2.Canny(gray, 50, 150)
+                    orientation_map = None
 
-                # Get boxes with BOTH required parameters
-                boxes, scores = edge_boxes.getBoundingBoxes(edges, orientation_map)
+                # Phase 4: Proposal Generation
+                try:
+                    if orientation_map is not None:
+                        boxes, scores = ctx.edge_boxes.getBoundingBoxes(edges, orientation_map)
+                    else:
+                        boxes, scores = ctx.edge_boxes.getBoundingBoxes(edges)
+                except:
+                    print(f"⚠️ EdgeBoxes failed: {filename}")
+                    boxes, scores = [], []
 
-                # Convert to proposal format
-                raw_proposals = [
-                    {"bbox": [float(x), float(y), float(w), float(h)],
-                    "score": float(s.item())}  # Fixed scalar conversion
-                    for (x, y, w, h), s in zip(boxes, scores)
-                ]
+                # Phase 5: Quality Filtering
+                raw_proposals = [{
+                    "bbox": [float(x/scale), float(y/scale), float(w/scale), float(h/scale)],
+                    "score": float(s.item())
+                } for (x,y,w,h), s in zip(boxes, scores)] if scale != 1.0 else [...] 
 
-                # Quality enhancement pipeline
                 filtered = self.enhancer.filter_proposals(raw_proposals)
                 nms_proposals = self.enhancer.apply_nms(filtered)
-
-                # Optional: Visual check (only for a subset of images to save time)
-                if self.config['debug'] and len(nms_proposals) > 0:
-                    vis_path = Path('debug') / f"{img['id']}_proposals.jpg"
-                    self.enhancer.visualize(
-                        img_path,
-                        nms_proposals,
-                        vis_path
-                    )
-
+                
                 return img, nms_proposals
 
             except Exception as e:
-                print(f"❌ Error processing {filename}: {str(e)}")
+                print(f"🚨 Critical failure: {filename} - {str(e)}")
                 return img, []
+            finally:
+                del ctx  # Clean up OpenCV context
 
+        # Processing pipeline
         for split in ['train', 'val']:
             data = self._load_json(split)
             images_dir = self.base_path / 'images' / split
 
-            # Use ThreadPoolExecutor for parallel processing
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [
-                    executor.submit(process_image, img, images_dir)
-                    for img in data['images']
-                ]
-
+            with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced workers for stability
+                futures = [executor.submit(process_image, img, images_dir)
+                        for img in data['images'] if 'proposals' not in img]
+                
                 for future in as_completed(futures):
                     img, proposals = future.result()
-                    img['proposals'] = proposals
+                    if proposals:
+                        # Merge with existing proposals
+                        existing = img.get('proposals', [])
+                        merged = self.enhancer.apply_nms(existing + proposals)
+                        img['proposals'] = merged[:150]  # Keep top proposals
 
             self._save_json(data, split)
-            print(f"Added proposals to {split} annotations")
+            print(f"✅ Quality update completed for {split}")
     
     def _process_single_image(args):
         img_info, split, base_path = args
@@ -294,6 +315,14 @@ enhancer_config = {
     'iou_thresh': 0.4  # NMS overlap threshold
 }
 
+enhancer_config.update({
+    'alpha': 0.75,  # More emphasis on strong edges
+    'beta': 0.85,   # Tighter grouping
+    'min_score': 0.2,
+    'iou_thresh': 0.5
+})
+
+
 # Configuration (Update these paths)
 config = {
     'data_root': 'cytology_images',
@@ -303,18 +332,19 @@ config = {
     'enhancer': enhancer_config,
     'debug': True  # Enable visualization for first 100 images
 }
+
 if __name__ == '__main__':
     # Initialize processor
-    processor = CytologyPreprocessor(config)
+    processor = CytologyPreprocessor(config, enhancer_config)
     
     # # 1. Add class splits
     # processor.add_class_splits(config['base_classes'])
     
     # # 2. Generate proposals
-    # processor.generate_proposals()
+    processor.generate_proposals()
     
     # # 3. Extract CLIP features
-    processor.extract_clip_features()
+    # processor.extract_clip_features()
     
     
     print("Preparation complete!")
